@@ -9,6 +9,8 @@ with open(target_path, 'r') as f:
 include_marker = '#include "third_party/tonic/scopes/dart_isolate_scope.h"'
 include_addition = include_marker + '''
 #include <cstdio>
+#include <cstdarg>
+#include <cerrno>
 #include <cstring>
 #include <cstdlib>
 #include <sys/socket.h>
@@ -18,7 +20,6 @@ include_addition = include_marker + '''
 content = content.replace(include_marker, include_addition, 1)
 
 koolbase_code = '''
-// Log to file instead of stdout (stdout unreliable in Flutter engine)
 static void kb_log(const char* fmt, ...) {
   FILE* f = fopen("/tmp/koolbase_log.txt", "a");
   if (!f) return;
@@ -109,10 +110,14 @@ static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
       uint8_t* target = (uint8_t*)(snapshot_data + i + 10);
       kb_log("found marker at offset 0x%lx target %p", (unsigned long)i, target);
 
-      size_t page_size = 4096;
+      long page_size = sysconf(_SC_PAGESIZE);
       uintptr_t page_start = (uintptr_t)target & ~(page_size - 1);
-      if (mprotect((void*)page_start, page_size * 2, PROT_READ | PROT_WRITE) != 0) {
-        kb_log("mprotect failed errno=%d", errno);
+      uintptr_t target_end = (uintptr_t)target + 3;
+      size_t protect_len = ((target_end - page_start + page_size - 1) / page_size) * page_size;
+      kb_log("page_size=%ld page_start=0x%lx protect_len=%zu", page_size, page_start, protect_len);
+
+      if (mprotect((void*)page_start, protect_len, PROT_READ | PROT_WRITE) != 0) {
+        kb_log("mprotect RW failed errno=%d", errno);
         return false;
       }
 
@@ -120,7 +125,9 @@ static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
       target[1] = new_price[1];
       target[2] = new_price[2];
 
-      mprotect((void*)page_start, page_size * 2, PROT_READ);
+      if (mprotect((void*)page_start, protect_len, PROT_READ) != 0) {
+        kb_log("mprotect R failed errno=%d", errno);
+      }
 
       kb_log("patched marker with new price: %c%c%c", new_price[0], new_price[1], new_price[2]);
       return true;
@@ -134,11 +141,6 @@ namespace flutter {'''
 
 content = content.replace('namespace flutter {', koolbase_code, 1)
 
-# Also add stdarg.h and errno
-old_include = '#include <cstdio>'
-new_include = '#include <cstdio>\n#include <cstdarg>\n#include <cerrno>'
-content = content.replace(old_include, new_include, 1)
-
 target_marker = '''  phase_ = Phase::Ready;
   return true;
 }
@@ -148,7 +150,6 @@ bool DartIsolate::LoadKernel('''
 replacement = '''  phase_ = Phase::Ready;
 
   // ==== KOOLBASE PATCH HOOK ====
-  // Clear log file on each hook entry
   { FILE* f = fopen("/tmp/koolbase_log.txt", "w"); if (f) fclose(f); }
   kb_log("hook entered at PrepareForRunningFromPrecompiledCode");
 
@@ -192,4 +193,4 @@ content = content.replace(target_marker, replacement, 1)
 with open(target_path, 'w') as f:
     f.write(content)
 
-print("Koolbase Phase 2c-v2 (file logging) applied")
+print("Koolbase Phase 2c-v3 (page-size fix) applied")
