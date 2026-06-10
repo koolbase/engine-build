@@ -125,28 +125,81 @@ jobs:
           path: koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}.zip
           retention-days: 7
 
-      - name: Upload to R2
+      - name: Upload to R2 and register with API
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          KOOLBASE_API_URL: ${{ secrets.KOOLBASE_API_URL }}
+          INTERNAL_API_KEY: ${{ secrets.INTERNAL_API_KEY }}
+          FLUTTER_VERSION: ${{ matrix.flutter_version }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -e
-          pip install --break-system-packages boto3
-          ARTIFACT_NAME="koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}"
+          pip install --break-system-packages boto3 requests
+          ARTIFACT_NAME="koolbase-engine-flutter-${FLUTTER_VERSION}-macos-${ARCH}"
+          ZIP="${ARTIFACT_NAME}.zip"
+
+          # Compute SHA256 + size
+          SHA256=$(shasum -a 256 "$ZIP" | awk '{print $1}')
+          SIZE=$(stat -f%z "$ZIP")
+          echo "sha256=$SHA256 size=$SIZE"
+
           python3 <<EOF
-          import boto3
-          import os
+          import boto3, os, requests, sys
+
+          zip_name = "${ZIP}"
+          r2_key = zip_name
+          sha256 = "${SHA256}"
+          size = int("${SIZE}")
+          flutter_version = os.environ["FLUTTER_VERSION"]
+          arch = os.environ["ARCH"]
+          api_url = os.environ["KOOLBASE_API_URL"].rstrip("/")
+          internal_key = os.environ["INTERNAL_API_KEY"]
+
+          # 1. Upload to R2
           s3 = boto3.client(
               's3',
               endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
               aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
               aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
-              region_name='auto'
+              region_name='auto',
           )
-          key = "$ARTIFACT_NAME.zip"
-          print(f"Uploading {key} to R2 bucket {os.environ['R2_BUCKET']}...")
-          s3.upload_file("$ARTIFACT_NAME.zip", os.environ['R2_BUCKET'], key)
-          print("Done.")
+          print(f"Uploading {r2_key} to R2...")
+          s3.upload_file(zip_name, os.environ['R2_BUCKET'], r2_key)
+          print("R2 upload done.")
+
+          # 2. Register engine (draft)
+          headers = {"X-Internal-Key": internal_key, "Content-Type": "application/json"}
+          payload = {
+              "flutter_version": flutter_version,
+              "koolbase_revision": 1,
+              "platform": "macos",
+              "arch": arch,
+              "r2_key": r2_key,
+              "size_bytes": size,
+              "sha256": sha256,
+          }
+          r = requests.post(f"{api_url}/internal/engines", json=payload, headers=headers, timeout=30)
+          if r.status_code == 409:
+              print("Engine variant already registered; skipping create.")
+              sys.exit(0)
+          if r.status_code != 201:
+              print(f"Register failed: {r.status_code} {r.text}")
+              sys.exit(1)
+          engine = r.json()
+          engine_id = engine["id"]
+          print(f"Registered engine {engine_id} (draft).")
+
+          # 3. Publish it
+          r2 = requests.patch(
+              f"{api_url}/internal/engines/{engine_id}",
+              json={"status": "published"},
+              headers=headers, timeout=30,
+          )
+          if r2.status_code != 200:
+              print(f"Publish failed: {r2.status_code} {r2.text}")
+              sys.exit(1)
+          print(f"Published engine {engine_id}.")
           EOF
