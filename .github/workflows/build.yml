@@ -1,11 +1,27 @@
-name: Build Koolbase Engine
+name: Build Koolbase Engines
+
 on:
   workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: 'Flutter version to build (leave empty for all)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 06:00 UTC
 
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        flutter_version:
+          - "3.22.3"
+          - "3.27.4"
+        arch:
+          - "arm64"
 
     steps:
       - name: Checkout
@@ -39,7 +55,7 @@ jobs:
             "]" > .gclient
           gclient sync --no-history --shallow
           cd src/flutter
-          git fetch origin refs/tags/3.22.3
+          git fetch origin refs/tags/${{ matrix.flutter_version }}
           git checkout FETCH_HEAD
           cd ../..
           gclient sync --no-history --shallow
@@ -66,26 +82,18 @@ jobs:
         run: |
           set -e
           cd engine/src/flutter
-          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=arm64 --target-os=mac --no-lto --no-prebuilt-dart-sdk
+          ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=${{ matrix.arch }} --target-os=mac --no-lto --no-prebuilt-dart-sdk
           ./tools/gn --runtime-mode=release --no-stripped --mac-cpu=x64 --target-os=mac --no-lto --no-prebuilt-dart-sdk
           cd ..
-          ninja -C out/mac_release_arm64 macos
-          ninja -C out/mac_release_arm64 gen_snapshot
-          ninja -C out/mac_release_arm64 flutter_patched_sdk
+          ninja -C out/mac_release_${{ matrix.arch }} macos
+          ninja -C out/mac_release_${{ matrix.arch }} gen_snapshot
+          ninja -C out/mac_release_${{ matrix.arch }} flutter_patched_sdk
           ninja -C out/mac_release gen_snapshot
 
       - name: Prepare artifact
         run: |
           set -e
-
-          # Symlink gen_snapshot_arm64
-          ln -sf gen_snapshot engine/src/out/mac_release_arm64/gen_snapshot_arm64
-
-          # Find dart-sdk — search all possible locations
-          echo "Searching for dart-sdk..."
-          echo "All dart-sdk locations:"
-          find engine/src -type d -name dart-sdk 2>/dev/null
-
+          ln -sf gen_snapshot engine/src/out/mac_release_${{ matrix.arch }}/gen_snapshot_arm64
           DART_SDK_PATH=$(find engine/src/out/mac_release -type d -name dart-sdk 2>/dev/null | head -n 1)
           if [ -z "$DART_SDK_PATH" ]; then
             DART_SDK_PATH=$(find engine/src/out -type d -name dart-sdk 2>/dev/null | head -n 1)
@@ -94,25 +102,51 @@ jobs:
             DART_SDK_PATH=$(find engine/src/third_party/dart -type d -name dart-sdk 2>/dev/null | head -n 1)
           fi
           if [ -z "$DART_SDK_PATH" ]; then
-            echo "❌ dart-sdk not found anywhere"
-            find engine/src -name "dart" -type f 2>/dev/null | head -10
+            echo "❌ dart-sdk not found"
             exit 1
           fi
-          echo "✅ dart-sdk found at $DART_SDK_PATH"
           mkdir -p engine/src/flutter/prebuilts/macos-x64/
           cp -r "$DART_SDK_PATH" engine/src/flutter/prebuilts/macos-x64/dart-sdk
 
-          # Verify
-          echo "=== mac_release_arm64 contents ==="
-          ls -la engine/src/out/mac_release_arm64/
-          echo "=== prebuilts contents ==="
-          ls -la engine/src/flutter/prebuilts/macos-x64/
+      - name: Package artifact
+        run: |
+          set -e
+          ARTIFACT_NAME="koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}"
+          mkdir -p "$ARTIFACT_NAME"
+          cp -r engine/src/out/mac_release_${{ matrix.arch }} "$ARTIFACT_NAME/"
+          cp -r engine/src/flutter/prebuilts/macos-x64 "$ARTIFACT_NAME/"
+          zip -r "$ARTIFACT_NAME.zip" "$ARTIFACT_NAME"
+          ls -lh "$ARTIFACT_NAME.zip"
 
-      - name: Upload engine output
+      - name: Upload to GitHub Actions
         uses: actions/upload-artifact@v4
         with:
-          name: mac_release_arm64
-          path: |
-            engine/src/out/mac_release_arm64/
-            engine/src/flutter/prebuilts/macos-x64/
+          name: koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}
+          path: koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}.zip
           retention-days: 7
+
+      - name: Upload to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -e
+          pip install --break-system-packages boto3
+          ARTIFACT_NAME="koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}"
+          python3 <<EOF
+          import boto3
+          import os
+          s3 = boto3.client(
+              's3',
+              endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+              aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+              aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
+              region_name='auto'
+          )
+          key = "$ARTIFACT_NAME.zip"
+          print(f"Uploading {key} to R2 bucket {os.environ['R2_BUCKET']}...")
+          s3.upload_file("$ARTIFACT_NAME.zip", os.environ['R2_BUCKET'], key)
+          print("Done.")
+          EOF
