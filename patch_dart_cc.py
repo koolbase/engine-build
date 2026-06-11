@@ -13,6 +13,7 @@ include_addition = include_marker + '''
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -30,6 +31,37 @@ static void kb_log(const char* fmt, ...) {
   fputc('\\n', f);
   fclose(f);
 }
+
+// ==== KOOLBASE SIGNATURE VERIFICATION (Phase 1, item 1) ====
+// BoringSSL is linked into the engine; we forward-declare ED25519_verify
+// with C linkage to avoid the openssl include chain in this TU.
+// Signature: returns 1 on success, 0 on failure.
+extern "C" int ED25519_verify(const uint8_t* message, size_t message_len,
+                              const uint8_t signature[64],
+                              const uint8_t public_key[32]);
+
+// Koolbase verification public key (dev keypair). The matching private key
+// signs the 64-byte KBPM header in writer_macho_v2.go. Rotating this key
+// requires an engine rebuild + app update (embedded-anchor trust model).
+static const uint8_t koolbase_pubkey[32] = {
+  0xba, 0x16, 0xbb, 0x70, 0x5e, 0xf2, 0xd1, 0x84, 0x08, 0xe7, 0xae, 0xd9,
+  0xa7, 0x69, 0x52, 0xdc, 0xbd, 0x9b, 0xec, 0x47, 0x37, 0xff, 0x1b, 0xa5,
+  0x58, 0x84, 0x65, 0x34, 0x81, 0x24, 0x26, 0xcb
+};
+
+// patch points at the full 128-byte KBPM blob:
+//   [0..63]   header (signed)
+//   [64..127] Ed25519 signature over the header
+static bool Koolbase_VerifySignature(const uint8_t* patch) {
+  int ok = ED25519_verify(patch, 64, patch + 64, koolbase_pubkey);
+  if (ok == 1) {
+    kb_log("signature VERIFIED");
+    return true;
+  }
+  kb_log("signature INVALID (ED25519_verify returned %d)", ok);
+  return false;
+}
+// ==== END KOOLBASE SIGNATURE VERIFICATION ====
 
 static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   const char* host = "127.0.0.1";
@@ -159,18 +191,23 @@ replacement = '''  phase_ = Phase::Ready;
            patch_buf[0], patch_buf[1], patch_buf[2], patch_buf[3]);
 
     if (patch_buf[0]=='K'&&patch_buf[1]=='B'&&patch_buf[2]=='P'&&patch_buf[3]=='M') {
-      char new_price[4] = {0};
-      new_price[0] = patch_buf[40];
-      new_price[1] = patch_buf[41];
-      new_price[2] = patch_buf[42];
-      kb_log("new price from patch: %s", new_price);
+      // Phase 1 item 1: verify signature before applying. Fail closed.
+      if (!Koolbase_VerifySignature(patch_buf)) {
+        kb_log("REJECTED: signature verification failed, patch NOT applied");
+      } else {
+        char new_price[4] = {0};
+        new_price[0] = patch_buf[40];
+        new_price[1] = patch_buf[41];
+        new_price[2] = patch_buf[42];
+        kb_log("new price from patch: %s", new_price);
 
-      auto snapshot = GetIsolateGroupData().GetIsolateSnapshot();
-      auto data_mapping = snapshot->GetDataMapping();
-      const uint8_t* snapshot_data = data_mapping;
-      kb_log("snapshot data at %p", snapshot_data);
+        auto snapshot = GetIsolateGroupData().GetIsolateSnapshot();
+        auto data_mapping = snapshot->GetDataMapping();
+        const uint8_t* snapshot_data = data_mapping;
+        kb_log("snapshot data at %p", snapshot_data);
 
-      Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
+        Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
+      }
     } else {
       kb_log("invalid magic number");
     }
@@ -193,4 +230,4 @@ content = content.replace(target_marker, replacement, 1)
 with open(target_path, 'w') as f:
     f.write(content)
 
-print("Koolbase Phase 2c-v3 (page-size fix) applied")
+print("Koolbase Phase 2c-v3 + Ed25519 signature verification applied")
