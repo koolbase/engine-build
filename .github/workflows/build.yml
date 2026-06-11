@@ -106,10 +106,23 @@ jobs:
           if [ -z "$DART_SDK_PATH" ]; then
             DART_SDK_PATH=$(find engine/src/third_party/dart -type d -name dart-sdk 2>/dev/null | head -n 1)
           fi
+          # Broadest fallback: search the whole engine tree. Flutter 3.27.x
+          # relocated the prebuilt dart-sdk vs 3.22.x; prefer a populated one
+          # (has bin/dart) over an empty dir match.
+          if [ -z "$DART_SDK_PATH" ]; then
+            for cand in $(find engine -type d -name dart-sdk 2>/dev/null); do
+              if [ -x "$cand/bin/dart" ]; then
+                DART_SDK_PATH="$cand"
+                break
+              fi
+            done
+          fi
           if [ -z "$DART_SDK_PATH" ]; then
             echo "❌ dart-sdk not found"
+            find engine -type d -name "dart-sdk" 2>/dev/null | head -20
             exit 1
           fi
+          echo "Using dart-sdk: $DART_SDK_PATH"
           mkdir -p engine/src/flutter/prebuilts/macos-x64/
           cp -r "$DART_SDK_PATH" engine/src/flutter/prebuilts/macos-x64/dart-sdk
           # Stage icon-tree-shaker host tools next to the engine output so the
