@@ -22,7 +22,7 @@ The approach builds on the engine-patching technique pioneered by the broader Fl
 
 | Flutter | Platform | Arch  | Status |
 |---------|----------|-------|--------|
-| 3.22.3  | macOS    | arm64 | ✅ Published |
+| 3.22.3  | macOS    | arm64 | Published |
 | 3.27.4  | macOS    | arm64 | 🚧 In progress |
 
 Android (ELF) and iOS targets are planned. The engine's Flutter version must match the app's Flutter SDK version exactly.
