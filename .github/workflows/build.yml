@@ -93,7 +93,7 @@ jobs:
           # Gated behind build_engine_artifacts in BUILD.gn; built into the host
           # output. Non-fatal: if a target name drifts, the engine still ships.
           ninja -C out/mac_release flutter/tools/const_finder || echo "WARN: const_finder build failed"
-          ninja -C out/mac_release flutter/tools/font-subset || echo "WARN: font-subset build failed"
+          ninja -C out/mac_release flutter/tools/font_subset || echo "WARN: font_subset build failed"
 
       - name: Prepare artifact
         run: |
@@ -116,7 +116,10 @@ jobs:
           # Flutter tool finds them under out/mac_release_<arch>/gen/. Non-fatal:
           # if not present the build still ships and apps use --no-tree-shake-icons.
           CONST_FINDER=$(find engine/src/out -name "const_finder.dart.snapshot" 2>/dev/null | head -n 1)
-          FONT_SUBSET=$(find engine/src/out -name "font-subset" -type f 2>/dev/null | head -n 1)
+          # The linked executable is named font-subset (hyphen) even though the
+          # ninja target is font_subset (underscore). Match either, skip object
+          # files under obj/, take the first real executable.
+          FONT_SUBSET=$(find engine/src/out \( -name "font-subset" -o -name "font_subset" \) -type f -perm +111 2>/dev/null | grep -v "/obj/" | head -n 1)
           mkdir -p engine/src/out/mac_release_${{ matrix.arch }}/gen
           if [ -n "$CONST_FINDER" ]; then
             cp "$CONST_FINDER" engine/src/out/mac_release_${{ matrix.arch }}/gen/const_finder.dart.snapshot
