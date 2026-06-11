@@ -40,6 +40,11 @@ extern "C" int ED25519_verify(const uint8_t* message, size_t message_len,
                               const uint8_t signature[64],
                               const uint8_t public_key[32]);
 
+// BoringSSL one-shot SHA-256; writes a 32-byte digest to out and returns it.
+// Forward-declared for the same reason as ED25519_verify (avoid the openssl
+// include chain in this TU).
+extern "C" uint8_t* SHA256(const uint8_t* data, size_t len, uint8_t* out);
+
 // Koolbase verification public key (dev keypair). The matching private key
 // signs the 64-byte KBPM header in writer_macho_v2.go. Rotating this key
 // requires an engine rebuild + app update (embedded-anchor trust model).
@@ -62,6 +67,35 @@ static bool Koolbase_VerifySignature(const uint8_t* patch) {
   return false;
 }
 // ==== END KOOLBASE SIGNATURE VERIFICATION ====
+
+// ==== KOOLBASE BUILD-ID VERIFICATION (Phase 1, item 2) ====
+// instructions = engine's in-memory isolate-snapshot instructions pointer.
+// Hash instructions_size bytes (header 56-63) and compare the first 8 bytes
+// to build_id (header 16-23). Both fields are inside the signed header, so a
+// patch built for a different binary is rejected. Fail-closed.
+static bool Koolbase_VerifyBuildId(const uint8_t* patch, const uint8_t* instructions) {
+  uint64_t instr_size = 0;
+  for (int i = 0; i < 8; i++) {
+    instr_size |= ((uint64_t)patch[56 + i]) << (8 * i);
+  }
+  if (instructions == nullptr || instr_size == 0) {
+    kb_log("build_id check FAILED: instructions=%p size=%llu",
+           instructions, (unsigned long long)instr_size);
+    return false;
+  }
+  uint8_t digest[32];
+  SHA256(instructions, (size_t)instr_size, digest);
+  for (int i = 0; i < 8; i++) {
+    if (digest[i] != patch[16 + i]) {
+      kb_log("build_id MISMATCH at byte %d: got %02x want %02x",
+             i, digest[i], patch[16 + i]);
+      return false;
+    }
+  }
+  kb_log("build_id VERIFIED (instr_size=%llu)", (unsigned long long)instr_size);
+  return true;
+}
+// ==== END KOOLBASE BUILD-ID VERIFICATION ====
 
 static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
   const char* host = "127.0.0.1";
@@ -195,18 +229,24 @@ replacement = '''  phase_ = Phase::Ready;
       if (!Koolbase_VerifySignature(patch_buf)) {
         kb_log("REJECTED: signature verification failed, patch NOT applied");
       } else {
-        char new_price[4] = {0};
-        new_price[0] = patch_buf[40];
-        new_price[1] = patch_buf[41];
-        new_price[2] = patch_buf[42];
-        kb_log("new price from patch: %s", new_price);
-
+        // Phase 1 item 2: verify build_id matches the running binary.
         auto snapshot = GetIsolateGroupData().GetIsolateSnapshot();
-        auto data_mapping = snapshot->GetDataMapping();
-        const uint8_t* snapshot_data = data_mapping;
-        kb_log("snapshot data at %p", snapshot_data);
+        const uint8_t* instructions = snapshot->GetInstructionsMapping();
+        if (!Koolbase_VerifyBuildId(patch_buf, instructions)) {
+          kb_log("REJECTED: build_id mismatch, patch NOT applied");
+        } else {
+          char new_price[4] = {0};
+          new_price[0] = patch_buf[40];
+          new_price[1] = patch_buf[41];
+          new_price[2] = patch_buf[42];
+          kb_log("new price from patch: %s", new_price);
 
-        Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
+          auto data_mapping = snapshot->GetDataMapping();
+          const uint8_t* snapshot_data = data_mapping;
+          kb_log("snapshot data at %p", snapshot_data);
+
+          Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
+        }
       }
     } else {
       kb_log("invalid magic number");
