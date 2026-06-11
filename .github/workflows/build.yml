@@ -89,6 +89,11 @@ jobs:
           ninja -C out/mac_release_${{ matrix.arch }} gen_snapshot
           ninja -C out/mac_release_${{ matrix.arch }} flutter_patched_sdk
           ninja -C out/mac_release gen_snapshot
+          # Host tools for icon tree-shaking (const_finder.dart.snapshot + font-subset).
+          # Gated behind build_engine_artifacts in BUILD.gn; built into the host
+          # output. Non-fatal: if a target name drifts, the engine still ships.
+          ninja -C out/mac_release flutter/tools/const_finder || echo "WARN: const_finder build failed"
+          ninja -C out/mac_release flutter/tools/font-subset || echo "WARN: font-subset build failed"
 
       - name: Prepare artifact
         run: |
@@ -107,14 +112,37 @@ jobs:
           fi
           mkdir -p engine/src/flutter/prebuilts/macos-x64/
           cp -r "$DART_SDK_PATH" engine/src/flutter/prebuilts/macos-x64/dart-sdk
+          # Stage icon-tree-shaker host tools next to the engine output so the
+          # Flutter tool finds them under out/mac_release_<arch>/gen/. Non-fatal:
+          # if not present the build still ships and apps use --no-tree-shake-icons.
+          CONST_FINDER=$(find engine/src/out -name "const_finder.dart.snapshot" 2>/dev/null | head -n 1)
+          FONT_SUBSET=$(find engine/src/out -name "font-subset" -type f 2>/dev/null | head -n 1)
+          mkdir -p engine/src/out/mac_release_${{ matrix.arch }}/gen
+          if [ -n "$CONST_FINDER" ]; then
+            cp "$CONST_FINDER" engine/src/out/mac_release_${{ matrix.arch }}/gen/const_finder.dart.snapshot
+            echo "Staged const_finder: $CONST_FINDER"
+          else
+            echo "WARN: const_finder.dart.snapshot not found"
+          fi
+          if [ -n "$FONT_SUBSET" ]; then
+            cp "$FONT_SUBSET" engine/src/out/mac_release_${{ matrix.arch }}/font-subset
+            echo "Staged font-subset: $FONT_SUBSET"
+          else
+            echo "WARN: font-subset not found"
+          fi
 
       - name: Package artifact
         run: |
           set -e
           ARTIFACT_NAME="koolbase-engine-flutter-${{ matrix.flutter_version }}-macos-${{ matrix.arch }}"
-          mkdir -p "$ARTIFACT_NAME"
-          cp -r engine/src/out/mac_release_${{ matrix.arch }} "$ARTIFACT_NAME/"
-          cp -r engine/src/flutter/prebuilts/macos-x64 "$ARTIFACT_NAME/"
+          # Nest under src/ so the extracted engine resolves to
+          # {version}/src/out/mac_release_<arch> and
+          # {version}/src/flutter/prebuilts/macos-x64/dart-sdk — the layout
+          # Flutter's --local-engine-src-path expects (matches the proven POC).
+          mkdir -p "$ARTIFACT_NAME/src/out"
+          cp -r engine/src/out/mac_release_${{ matrix.arch }} "$ARTIFACT_NAME/src/out/"
+          mkdir -p "$ARTIFACT_NAME/src/flutter/prebuilts"
+          cp -r engine/src/flutter/prebuilts/macos-x64 "$ARTIFACT_NAME/src/flutter/prebuilts/"
           zip -r "$ARTIFACT_NAME.zip" "$ARTIFACT_NAME"
           ls -lh "$ARTIFACT_NAME.zip"
 
