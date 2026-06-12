@@ -2,26 +2,27 @@
 #
 # Koolbase System B #1 — whole-blob snapshot replacement.
 #
-# Injects into dart_snapshot.cc (NOT dart_isolate.cc — that is the marker
-# injector patch_dart_cc.py). This intercepts IsolateSnapshotFromSettings, the
-# single seam where the engine hands the isolate's data+instructions mappings to
-# Dart. When a verified whole-blob patch is staged, we reconstruct the snapshot
-# into fresh buffers (instructions into MAP_JIT executable memory) and build the
-# DartSnapshot from those via the engine's own IsolateSnapshotFromMappings()
-# factory. Dart creates the isolate from our blob and never knows the difference.
+# Injects into dart_snapshot.cc. Intercepts IsolateSnapshotFromSettings (the seam
+# where the engine hands the isolate's data+instructions to Dart). When a verified
+# whole-blob patch is staged, reconstruct the snapshot into fresh buffers
+# (instructions into MAP_JIT executable memory) and build the DartSnapshot via the
+# engine's own IsolateSnapshotFromMappings() factory.
 #
-# IDENTITY MILESTONE: reconstruction is a byte-for-byte copy of the base blobs
-# (no diff applied). If the app runs from these copies, seam + exec memory +
-# supply path are proven; a real diff is just non-identity bytes in MakeExecCopy
-# / the data memcpy.
+# Two kinds:
+#   kind=2  IDENTITY  — copy the running base (proves the mechanism; app unchanged)
+#   kind=3  REPLACE   — copy a NEW snapshot carried in the patch payload (real
+#                       recompiled-Dart change takes effect; app behavior changes)
 #
-# Whole-blob patch header (128-byte KBPM frame, signed [0..63]):
+# Patch header (128-byte KBPM frame, signed [0..63]):
 #   [0..3]    "KBPM"
-#   [8]       kind = 2  (2 = whole-blob; marker patches leave this 0)
-#   [16..23]  build_id (first 8 bytes of SHA-256 over base instructions)
-#   [24..31]  base_data_size  (little-endian u64)   <- NEW for whole-blob
-#   [56..63]  base_instr_size (little-endian u64)   <- same field as marker
+#   [8]       kind (2 = identity, 3 = full replacement)
+#   [16..23]  build_id (first 8 bytes of SHA-256 over the BASE instructions)
+#   [24..31]  new_data_size  (LE u64)
+#   [32..39]  new_instr_size (LE u64)   (kind=3)
+#   [40..55]  SHA-256(payload)[0:16]    (kind=3; binds payload to signed header)
+#   [56..63]  base_instr_size (LE u64)  (bytes the build_id is hashed over)
 #   [64..127] Ed25519 signature over [0..63]
+#   [128..]   payload = new_data || new_instr   (kind=3 only)
 
 target_path = "engine/src/flutter/runtime/dart_snapshot.cc"
 
@@ -62,8 +63,6 @@ static void kb_log(const char* fmt, ...) {
   fclose(f);
 }
 
-// BoringSSL is linked into the engine; forward-declare with C linkage to avoid
-// the openssl include chain in this TU (same pattern as the marker injector).
 extern "C" int ED25519_verify(const uint8_t* message, size_t message_len,
                               const uint8_t signature[64],
                               const uint8_t public_key[32]);
@@ -117,16 +116,25 @@ static bool Koolbase_VmPath(const char* leaf, char* out, size_t out_len) {
   return true;
 }
 
-static bool Koolbase_ReadStagedPatch(uint8_t* buf, size_t buf_len) {
+// Read the entire staged patch (header + optional payload) into a malloc'd
+// buffer. Caller frees. Returns nullptr if absent or too short for a header.
+static uint8_t* Koolbase_ReadStagedFile(size_t* out_len) {
   char path[1024];
-  if (!Koolbase_VmPath("staged.kbpatch", path, sizeof(path))) return false;
+  if (!Koolbase_VmPath("staged.kbpatch", path, sizeof(path))) return nullptr;
   FILE* f = fopen(path, "rb");
-  if (!f) { kb_log("no staged patch at %s", path); return false; }
-  size_t got = fread(buf, 1, buf_len, f);
+  if (!f) { kb_log("no staged patch at %s", path); return nullptr; }
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz < 128) { fclose(f); kb_log("staged patch too small: %ld", sz); return nullptr; }
+  uint8_t* buf = (uint8_t*)malloc((size_t)sz);
+  if (!buf) { fclose(f); kb_log("staged malloc failed"); return nullptr; }
+  size_t got = fread(buf, 1, (size_t)sz, f);
   fclose(f);
-  if (got < buf_len) { kb_log("staged patch too short: %zu bytes", got); return false; }
-  kb_log("read %zu staged bytes from %s", buf_len, path);
-  return true;
+  if (got != (size_t)sz) { free(buf); kb_log("staged short read %zu/%ld", got, sz); return nullptr; }
+  *out_len = (size_t)sz;
+  kb_log("read %ld staged bytes from %s", sz, path);
+  return buf;
 }
 
 static void Koolbase_MarkApplied() {
@@ -138,70 +146,104 @@ static void Koolbase_MarkApplied() {
 }
 
 // Allocate executable memory and copy `len` reconstructed instruction bytes
-// into it (MAP_JIT W^X dance — proven on Apple Silicon via the jittest probe).
+// into it (MAP_JIT W^X dance, proven on Apple Silicon).
 //
 // pthread_jit_write_protect_np is macOS 11+; the engine's deployment target is
-// 10.14 and compiles -Werror -Wunguarded-availability-new, so the call must be
-// guarded. arm64 macOS is always 11+, so the guarded path runs on every real
-// device; the __builtin_available check is purely to satisfy the 10.14 compiler.
+// 10.14 and compiles -Werror -Wunguarded-availability-new, so guard it. arm64
+// macOS is always 11+, so the guarded path runs on every real device.
 static const uint8_t* Koolbase_MakeExecCopy(const uint8_t* src, size_t len) {
   void* mem = mmap(nullptr, len, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (mem == MAP_FAILED) { kb_log("exec mmap failed errno=%d", errno); return nullptr; }
   if (__builtin_available(macOS 11.0, *)) {
-    pthread_jit_write_protect_np(0);   // make MAP_JIT pages writable
-    memcpy(mem, src, len);             // (identity copy; real diff applied here)
-    pthread_jit_write_protect_np(1);   // make them executable
+    pthread_jit_write_protect_np(0);
+    memcpy(mem, src, len);
+    pthread_jit_write_protect_np(1);
   } else {
-    memcpy(mem, src, len);             // pre-11 (Intel): MAP_JIT is directly RWX
+    memcpy(mem, src, len);
   }
   sys_icache_invalidate(mem, len);
   kb_log("exec copy %zu bytes -> %p", len, mem);
   return (const uint8_t*)mem;
 }
 
-// Build a replacement isolate snapshot from a verified staged whole-blob patch.
-// Returns nullptr to fall back to the embedded snapshot (no patch / bad magic /
-// wrong kind / verification failure / allocation failure).
+// Build a replacement isolate snapshot from a verified staged patch.
+//   kind=2 (identity)    : new blobs are a copy of the running base.
+//   kind=3 (replacement) : new blobs come from the patch payload (new_data ||
+//                          new_instr), verified against the signed payload hash.
+// Returns nullptr to fall back to the embedded snapshot.
 static fml::RefPtr<DartSnapshot> Koolbase_TryBuildPatchedSnapshot(
     const std::shared_ptr<const fml::Mapping>& base_data,
     const std::shared_ptr<const fml::Mapping>& base_instr) {
-  uint8_t patch[128];
-  if (!Koolbase_ReadStagedPatch(patch, 128)) return nullptr;
-  if (!(patch[0]=='K'&&patch[1]=='B'&&patch[2]=='P'&&patch[3]=='M')) {
-    kb_log("invalid magic"); return nullptr;
+  size_t total = 0;
+  uint8_t* buf = Koolbase_ReadStagedFile(&total);
+  if (!buf) return nullptr;
+
+  if (!(buf[0]=='K'&&buf[1]=='B'&&buf[2]=='P'&&buf[3]=='M')) {
+    kb_log("invalid magic"); free(buf); return nullptr;
   }
-  if (patch[8] != 2) {  // kind 2 = whole-blob; anything else isn't ours
-    kb_log("not a whole-blob patch (kind=%d), falling back", patch[8]);
-    return nullptr;
+  uint8_t kind = buf[8];
+  if (kind != 2 && kind != 3) {
+    kb_log("kind %d not whole-blob, falling back", kind); free(buf); return nullptr;
   }
 
   const uint8_t* base_instr_ptr = base_instr->GetMapping();
   const uint8_t* base_data_ptr  = base_data->GetMapping();
-  uint64_t base_instr_len = Koolbase_ReadU64(patch + 56);
-  uint64_t base_data_len  = Koolbase_ReadU64(patch + 24);
+  uint64_t base_instr_len = Koolbase_ReadU64(buf + 56);
 
-  if (!Koolbase_VerifySignature(patch))            { kb_log("REJECTED: signature"); return nullptr; }
-  if (!Koolbase_VerifyBuildId(patch, base_instr_ptr)) { kb_log("REJECTED: build_id"); return nullptr; }
-  if (base_data_ptr == nullptr || base_data_len == 0) {
-    kb_log("REJECTED: base data ptr=%p len=%llu",
-           base_data_ptr, (unsigned long long)base_data_len);
-    return nullptr;
+  if (!Koolbase_VerifySignature(buf))                 { kb_log("REJECTED: signature"); free(buf); return nullptr; }
+  if (!Koolbase_VerifyBuildId(buf, base_instr_ptr))   { kb_log("REJECTED: build_id"); free(buf); return nullptr; }
+
+  uint64_t new_data_len, new_instr_len;
+  const uint8_t* src_data;
+  const uint8_t* src_instr;
+
+  if (kind == 2) {
+    // identity: reconstruct the running base byte-for-byte
+    new_data_len  = Koolbase_ReadU64(buf + 24);
+    new_instr_len = base_instr_len;
+    if (base_data_ptr == nullptr || new_data_len == 0) {
+      kb_log("REJECTED: base data ptr=%p len=%llu",
+             base_data_ptr, (unsigned long long)new_data_len);
+      free(buf); return nullptr;
+    }
+    src_data  = base_data_ptr;
+    src_instr = base_instr_ptr;
+  } else {
+    // kind == 3: full replacement from payload = new_data || new_instr
+    new_data_len  = Koolbase_ReadU64(buf + 24);
+    new_instr_len = Koolbase_ReadU64(buf + 32);
+    uint64_t payload_len = new_data_len + new_instr_len;
+    if (payload_len == 0 || total < (size_t)(128 + payload_len)) {
+      kb_log("REJECTED: payload size (have %zu need %llu)",
+             total, (unsigned long long)(128 + payload_len));
+      free(buf); return nullptr;
+    }
+    const uint8_t* payload = buf + 128;
+    uint8_t digest[32];
+    SHA256(payload, (size_t)payload_len, digest);
+    for (int i = 0; i < 16; i++) {
+      if (digest[i] != buf[40 + i]) {
+        kb_log("REJECTED: payload hash mismatch at byte %d", i);
+        free(buf); return nullptr;
+      }
+    }
+    kb_log("payload hash VERIFIED (data=%llu instr=%llu)",
+           (unsigned long long)new_data_len, (unsigned long long)new_instr_len);
+    src_data  = payload;
+    src_instr = payload + new_data_len;
   }
 
-  // ---- reconstruct (identity milestone: new == base) ----
-  uint64_t new_instr_len = base_instr_len;   // real diff: read from header
-  uint64_t new_data_len  = base_data_len;
-
-  const uint8_t* new_instr = Koolbase_MakeExecCopy(base_instr_ptr, new_instr_len);
-  if (!new_instr) return nullptr;
-
+  // Copy out (instructions into MAP_JIT exec memory; data into a plain buffer)
+  // BEFORE freeing the staged file buffer that src_* may point into.
+  const uint8_t* new_instr = Koolbase_MakeExecCopy(src_instr, new_instr_len);
+  if (!new_instr) { free(buf); return nullptr; }
   uint8_t* new_data = (uint8_t*)malloc(new_data_len);
-  if (!new_data) { kb_log("data malloc failed"); return nullptr; }
-  memcpy(new_data, base_data_ptr, new_data_len);
+  if (!new_data) { kb_log("data malloc failed"); free(buf); return nullptr; }
+  memcpy(new_data, src_data, new_data_len);
 
-  // NonOwnedMapping(ptr, size, release_proc, dontneed_safe). release_proc is
-  // null: these buffers intentionally live for the process lifetime.
+  free(buf);  // payload copied out; safe to release
+
   auto instr_map = std::make_shared<fml::NonOwnedMapping>(
       new_instr, new_instr_len, nullptr, false);
   auto data_map = std::make_shared<fml::NonOwnedMapping>(
@@ -210,8 +252,8 @@ static fml::RefPtr<DartSnapshot> Koolbase_TryBuildPatchedSnapshot(
   auto snapshot = DartSnapshot::IsolateSnapshotFromMappings(data_map, instr_map);
   if (!snapshot) { kb_log("IsolateSnapshotFromMappings returned null"); return nullptr; }
 
-  kb_log("** Koolbase: isolate from RECONSTRUCTED snapshot (instr=%llu data=%llu) **",
-         (unsigned long long)new_instr_len, (unsigned long long)new_data_len);
+  kb_log("** Koolbase: isolate from RECONSTRUCTED snapshot kind=%d (instr=%llu data=%llu) **",
+         (int)kind, (unsigned long long)new_instr_len, (unsigned long long)new_data_len);
   Koolbase_MarkApplied();
   return snapshot;
 }
@@ -253,4 +295,4 @@ content = content.replace(hook_anchor, hook_addition, 1)
 with open(target_path, 'w') as f:
     f.write(content)
 
-print("Koolbase System B #1: whole-blob interception injected into dart_snapshot.cc")
+print("Koolbase System B #1: whole-blob interception (kind 2 identity + kind 3 replacement) injected")
