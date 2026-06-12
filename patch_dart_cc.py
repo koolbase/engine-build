@@ -14,8 +14,6 @@ include_addition = include_marker + '''
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
-#include <sys/socket.h>
-#include <netdb.h>
 #include <unistd.h>
 #include <sys/mman.h>'''
 content = content.replace(include_marker, include_addition, 1)
@@ -35,19 +33,15 @@ static void kb_log(const char* fmt, ...) {
 // ==== KOOLBASE SIGNATURE VERIFICATION (Phase 1, item 1) ====
 // BoringSSL is linked into the engine; we forward-declare ED25519_verify
 // with C linkage to avoid the openssl include chain in this TU.
-// Signature: returns 1 on success, 0 on failure.
 extern "C" int ED25519_verify(const uint8_t* message, size_t message_len,
                               const uint8_t signature[64],
                               const uint8_t public_key[32]);
 
 // BoringSSL one-shot SHA-256; writes a 32-byte digest to out and returns it.
-// Forward-declared for the same reason as ED25519_verify (avoid the openssl
-// include chain in this TU).
 extern "C" uint8_t* SHA256(const uint8_t* data, size_t len, uint8_t* out);
 
 // Koolbase verification public key (dev keypair). The matching private key
-// signs the 64-byte KBPM header in writer_macho_v2.go. Rotating this key
-// requires an engine rebuild + app update (embedded-anchor trust model).
+// signs the 64-byte KBPM header in writer_macho_v2.go / the koolbase CLI.
 static const uint8_t koolbase_pubkey[32] = {
   0xba, 0x16, 0xbb, 0x70, 0x5e, 0xf2, 0xd1, 0x84, 0x08, 0xe7, 0xae, 0xd9,
   0xa7, 0x69, 0x52, 0xdc, 0xbd, 0x9b, 0xec, 0x47, 0x37, 0xff, 0x1b, 0xa5,
@@ -69,10 +63,8 @@ static bool Koolbase_VerifySignature(const uint8_t* patch) {
 // ==== END KOOLBASE SIGNATURE VERIFICATION ====
 
 // ==== KOOLBASE BUILD-ID VERIFICATION (Phase 1, item 2) ====
-// instructions = engine's in-memory isolate-snapshot instructions pointer.
 // Hash instructions_size bytes (header 56-63) and compare the first 8 bytes
-// to build_id (header 16-23). Both fields are inside the signed header, so a
-// patch built for a different binary is rejected. Fail-closed.
+// to build_id (header 16-23). Both are inside the signed header. Fail-closed.
 static bool Koolbase_VerifyBuildId(const uint8_t* patch, const uint8_t* instructions) {
   uint64_t instr_size = 0;
   for (int i = 0; i < 8; i++) {
@@ -97,64 +89,43 @@ static bool Koolbase_VerifyBuildId(const uint8_t* patch, const uint8_t* instruct
 }
 // ==== END KOOLBASE BUILD-ID VERIFICATION ====
 
-static bool Koolbase_FetchPatch(uint8_t* buf, size_t buf_len) {
-  const char* host = "127.0.0.1";
-  const char* port_str = "9876";
-
-  struct addrinfo hints = {};
-  struct addrinfo* res = nullptr;
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-
-  if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-    kb_log("DNS failed");
-    return false;
-  }
-
-  int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (sock < 0) {
-    freeaddrinfo(res);
-    kb_log("socket failed");
-    return false;
-  }
-
-  if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) {
-    freeaddrinfo(res);
-    close(sock);
-    kb_log("connect failed");
-    return false;
-  }
-  freeaddrinfo(res);
-
-  const char* request = "GET /patch HTTP/1.0\\r\\nHost: 127.0.0.1:9876\\r\\nConnection: close\\r\\n\\r\\n";
-  send(sock, request, strlen(request), 0);
-
-  char response[2048] = {};
-  int total = 0;
-  int n;
-  while ((n = recv(sock, response + total, sizeof(response) - total - 1, 0)) > 0) {
-    total += n;
-  }
-  close(sock);
-
-  const char* header_end = strstr(response, "\\r\\n\\r\\n");
-  if (header_end == nullptr) {
-    kb_log("bad HTTP response");
-    return false;
-  }
-
-  const uint8_t* body = reinterpret_cast<const uint8_t*>(header_end + 4);
-  size_t body_len = total - (header_end + 4 - response);
-
-  if (body_len < buf_len) {
-    kb_log("response too short: %zu bytes", body_len);
-    return false;
-  }
-
-  memcpy(buf, body, buf_len);
-  kb_log("fetched %zu bytes", buf_len);
+// ==== KOOLBASE STAGED-PATCH IO (Phase 2, item 5) ====
+// Shared directory with the Dart SDK: $HOME/Library/Application Support/
+// koolbase/vm/. The SDK stages staged.kbpatch here on a prior launch; we read
+// it (no network), verify, apply, then rename to applied.kbpatch so the SDK
+// can advance current_patch. Bundle-id-free so the pure-C path matches the
+// SDK's in-process getenv("HOME") without dragging in Foundation.
+static bool Koolbase_VmPath(const char* leaf, char* out, size_t out_len) {
+  const char* home = getenv("HOME");
+  if (!home) { kb_log("no HOME env"); return false; }
+  snprintf(out, out_len,
+           "%s/Library/Application Support/koolbase/vm/%s", home, leaf);
   return true;
 }
+
+static bool Koolbase_ReadStagedPatch(uint8_t* buf, size_t buf_len) {
+  char path[1024];
+  if (!Koolbase_VmPath("staged.kbpatch", path, sizeof(path))) return false;
+  FILE* f = fopen(path, "rb");
+  if (!f) { kb_log("no staged patch at %s", path); return false; }
+  size_t got = fread(buf, 1, buf_len, f);
+  fclose(f);
+  if (got < buf_len) { kb_log("staged patch too short: %zu bytes", got); return false; }
+  kb_log("read %zu staged bytes from %s", buf_len, path);
+  return true;
+}
+
+static void Koolbase_MarkApplied() {
+  char src[1024], dst[1024];
+  if (!Koolbase_VmPath("staged.kbpatch", src, sizeof(src))) return;
+  if (!Koolbase_VmPath("applied.kbpatch", dst, sizeof(dst))) return;
+  if (rename(src, dst) == 0) {
+    kb_log("renamed staged -> applied");
+  } else {
+    kb_log("rename staged->applied failed errno=%d", errno);
+  }
+}
+// ==== END KOOLBASE STAGED-PATCH IO ====
 
 static bool Koolbase_FindAndPatchMarker(const uint8_t* snapshot_data,
                                         size_t scan_size,
@@ -220,8 +191,8 @@ replacement = '''  phase_ = Phase::Ready;
   kb_log("hook entered at PrepareForRunningFromPrecompiledCode");
 
   uint8_t patch_buf[128];
-  if (Koolbase_FetchPatch(patch_buf, 128)) {
-    kb_log("fetch returned true, magic bytes: %c%c%c%c",
+  if (Koolbase_ReadStagedPatch(patch_buf, 128)) {
+    kb_log("staged read true, magic bytes: %c%c%c%c",
            patch_buf[0], patch_buf[1], patch_buf[2], patch_buf[3]);
 
     if (patch_buf[0]=='K'&&patch_buf[1]=='B'&&patch_buf[2]=='P'&&patch_buf[3]=='M') {
@@ -245,14 +216,16 @@ replacement = '''  phase_ = Phase::Ready;
           const uint8_t* snapshot_data = data_mapping;
           kb_log("snapshot data at %p", snapshot_data);
 
-          Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price);
+          if (Koolbase_FindAndPatchMarker(snapshot_data, 16 * 1024 * 1024, new_price)) {
+            Koolbase_MarkApplied();
+          }
         }
       }
     } else {
       kb_log("invalid magic number");
     }
   } else {
-    kb_log("fetch returned false");
+    kb_log("no staged patch this launch");
   }
   // ==== END KOOLBASE ====
 
@@ -270,4 +243,4 @@ content = content.replace(target_marker, replacement, 1)
 with open(target_path, 'w') as f:
     f.write(content)
 
-print("Koolbase Phase 2c-v3 + Ed25519 signature verification applied")
+print("Koolbase Phase 2 item 5: staged-file read + rename-on-apply applied")
