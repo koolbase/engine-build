@@ -139,13 +139,22 @@ static void Koolbase_MarkApplied() {
 
 // Allocate executable memory and copy `len` reconstructed instruction bytes
 // into it (MAP_JIT W^X dance — proven on Apple Silicon via the jittest probe).
+//
+// pthread_jit_write_protect_np is macOS 11+; the engine's deployment target is
+// 10.14 and compiles -Werror -Wunguarded-availability-new, so the call must be
+// guarded. arm64 macOS is always 11+, so the guarded path runs on every real
+// device; the __builtin_available check is purely to satisfy the 10.14 compiler.
 static const uint8_t* Koolbase_MakeExecCopy(const uint8_t* src, size_t len) {
   void* mem = mmap(nullptr, len, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
   if (mem == MAP_FAILED) { kb_log("exec mmap failed errno=%d", errno); return nullptr; }
-  pthread_jit_write_protect_np(0);   // make MAP_JIT pages writable
-  memcpy(mem, src, len);             // (identity copy; real diff applied here)
-  pthread_jit_write_protect_np(1);   // make them executable
+  if (__builtin_available(macOS 11.0, *)) {
+    pthread_jit_write_protect_np(0);   // make MAP_JIT pages writable
+    memcpy(mem, src, len);             // (identity copy; real diff applied here)
+    pthread_jit_write_protect_np(1);   // make them executable
+  } else {
+    memcpy(mem, src, len);             // pre-11 (Intel): MAP_JIT is directly RWX
+  }
   sys_icache_invalidate(mem, len);
   kb_log("exec copy %zu bytes -> %p", len, mem);
   return (const uint8_t*)mem;
