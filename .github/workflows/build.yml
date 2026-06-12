@@ -63,7 +63,7 @@ jobs:
       - name: Apply Koolbase patches
         run: |
           set -e
-          python3 patch_dart_cc.py
+          python3 patch_snapshot_cc.py
 
       - name: Fix freetype2 build issue
         run: |
